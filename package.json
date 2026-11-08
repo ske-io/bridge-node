@@ -1,0 +1,173 @@
+{
+  "name": "@ske-io/bridge",
+  "version": "0.1.0",
+  "description": "Runs a Node application's web server, background jobs and scheduled tasks on SKE.",
+  "license": "MIT",
+  "author": "SKE",
+  "homepage": "https://ske.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ske-io/bridge-node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ske-io/bridge-node/issues"
+  },
+  "keywords": [
+    "ske",
+    "express",
+    "fastify",
+    "koa",
+    "hono",
+    "nestjs",
+    "queue",
+    "scheduler",
+    "serverless"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "sideEffects": false,
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/cjs/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./express": {
+      "import": {
+        "types": "./dist/esm/express.d.ts",
+        "default": "./dist/esm/express.js"
+      },
+      "require": {
+        "types": "./dist/cjs/express.d.ts",
+        "default": "./dist/cjs/express.js"
+      }
+    },
+    "./fastify": {
+      "import": {
+        "types": "./dist/esm/fastify.d.ts",
+        "default": "./dist/esm/fastify.js"
+      },
+      "require": {
+        "types": "./dist/cjs/fastify.d.ts",
+        "default": "./dist/cjs/fastify.js"
+      }
+    },
+    "./koa": {
+      "import": {
+        "types": "./dist/esm/koa.d.ts",
+        "default": "./dist/esm/koa.js"
+      },
+      "require": {
+        "types": "./dist/cjs/koa.d.ts",
+        "default": "./dist/cjs/koa.js"
+      }
+    },
+    "./hono": {
+      "import": {
+        "types": "./dist/esm/hono.d.ts",
+        "default": "./dist/esm/hono.js"
+      },
+      "require": {
+        "types": "./dist/cjs/hono.d.ts",
+        "default": "./dist/cjs/hono.js"
+      }
+    },
+    "./http": {
+      "import": {
+        "types": "./dist/esm/http.d.ts",
+        "default": "./dist/esm/http.js"
+      },
+      "require": {
+        "types": "./dist/cjs/http.d.ts",
+        "default": "./dist/cjs/http.js"
+      }
+    },
+    "./nest": {
+      "import": {
+        "types": "./dist/esm/nest.d.ts",
+        "default": "./dist/esm/nest.js"
+      },
+      "require": {
+        "types": "./dist/cjs/nest.d.ts",
+        "default": "./dist/cjs/nest.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "ske-bridge": "./dist/esm/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "rm -rf build && tsc -p test/tsconfig.json && node --test --test-concurrency=4 'build/test/**/*.test.js'",
+    "check": "bun run typecheck && bun run build && bun run test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1164.0"
+  },
+  "peerDependencies": {
+    "express": ">=4.18",
+    "fastify": ">=4",
+    "koa": ">=2.13",
+    "hono": ">=4",
+    "@nestjs/common": ">=10",
+    "@nestjs/core": ">=10",
+    "@nestjs/schedule": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    },
+    "fastify": {
+      "optional": true
+    },
+    "koa": {
+      "optional": true
+    },
+    "hono": {
+      "optional": true
+    },
+    "@nestjs/common": {
+      "optional": true
+    },
+    "@nestjs/core": {
+      "optional": true
+    },
+    "@nestjs/schedule": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@nestjs/common": "^12.4.0",
+    "@nestjs/core": "^12.4.0",
+    "@nestjs/platform-express": "^12.4.0",
+    "@nestjs/platform-fastify": "^12.4.0",
+    "@nestjs/schedule": "^12.0.3",
+    "@types/express": "^5.0.6",
+    "@types/koa": "^3.0.3",
+    "@types/node": "^26.6.6",
+    "express": "^5.3.0",
+    "fastify": "^5.12.8",
+    "hono": "^4.13.17",
+    "koa": "^3.3.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "typescript": "^7.0.2"
+  }
+}
