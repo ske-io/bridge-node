@@ -1,0 +1,1 @@
+{ "name": "configured-app", "type": "module", "ske": { "schedule": "tasks/schedule.js" } }
