@@ -1,6 +1,6 @@
 {
   "name": "@ske-io/bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Runs a Node application's web server, background jobs and scheduled tasks on SKE.",
   "license": "MIT",
   "author": "SKE",
