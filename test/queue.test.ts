@@ -171,25 +171,85 @@ test('records reached after the batch deadline are released unstarted, with no f
   const { json } = await deliver(batch([record('m1', 'q-late', {}, 3), record('m2', 'q-late', {}, 3)], { tries: 3, deadline_ms: Date.now() - 1000 }));
   assert.equal(ran, 0);
   assert.deepEqual(
-    json.outcomes.map((o: any) => [o.message_id, o.released, o.release_delay, o.failed]),
+    json.outcomes.map((o: any) => [o.message_id, o.released, o.release_delay, o.keeps_tries, o.failed]),
     [
-      ['m1', true, null, false],
-      ['m2', true, null, false],
+      ['m1', true, null, true, false],
+      ['m2', true, null, true, false],
     ],
   );
 });
 
-test('a job cut short by the batch deadline is released, even on its last try', async () => {
-  defineJob('q-cut', (_payload, job) => new Promise<void>((resolve) => job.signal.addEventListener('abort', () => resolve())));
+test('a counted release has an explicit delay and does not say it keeps tries', async () => {
+  defineJob('q-counted', () => {
+    throw new Error('again');
+  });
+  const { json } = await deliver(batch([record('m1', 'q-counted', {}, 1)], { tries: 2 }));
+  assert.equal(json.outcomes[0].release_delay, 0);
+  assert.equal('keeps_tries' in json.outcomes[0], false);
+});
 
-  // 2s left keeps back min(5s, 1s): the batch stops 1s from now, well before
-  // the job's own 55s limit.
+/** A job that waits until it is told to stop. */
+const waitsForAbort = (_payload: unknown, job: JobContext) => new Promise<void>((resolve) => job.signal.addEventListener('abort', () => resolve()));
+
+test("a first job that runs to the batch's deadline owns that timeout and uses a try", async () => {
+  defineJob('q-first-overrun', waitsForAbort);
+
+  // As on the platform: the deadline is the queue's 2s timeout less the
+  // platform's own margin for answering, so the batch has 1.8s less
+  // min(5s, 0.9s), 0.9s, just under the job's own 1s. That is its full time.
+  const first = await deliver(batch([record('m1', 'q-first-overrun', {}, 1)], { timeout: 2, tries: 2, backoff: 7, deadline_ms: Date.now() + 1800 }));
+  assert.deepEqual([first.json.outcomes[0].released, first.json.outcomes[0].release_delay, 'keeps_tries' in first.json.outcomes[0]], [true, 7, false]);
+
+  // 2s left keeps back 1s: the batch stops 1s from now, well before the
+  // job's own 55s limit, but nothing else used the time: it fails on its
+  // last try.
   const started = Date.now();
-  const { json } = await deliver(batch([record('m1', 'q-cut', {}, 1)], { timeout: 60, tries: 1, deadline_ms: Date.now() + 2000 }));
+  const last = await deliver(batch([record('m1', 'q-first-overrun', {}, 1)], { timeout: 60, tries: 1, deadline_ms: Date.now() + 2000 }));
   const took = Date.now() - started;
   assert.ok(took >= 800 && took < 1900, `took ${took}ms`);
-  assert.deepEqual([json.outcomes[0].released, json.outcomes[0].release_delay, json.outcomes[0].failed], [true, null, false]);
+  assert.deepEqual([last.json.outcomes[0].failed, last.json.outcomes[0].dead_letter], [true, true]);
 });
+
+test('a later job cut short by earlier work in the batch is released keeping its tries, even on its last try', async () => {
+  defineJob('q-cut-first', () => busy(500));
+  defineJob('q-cut', waitsForAbort);
+
+  // 3.6s left keeps back 1.8s: 1.8s for the batch, under the job's own 2s.
+  // The first job takes 0.5s of it, so the second is cut short by the batch.
+  const { json } = await deliver(
+    batch([record('a', 'q-cut-first', {}, 1), record('b', 'q-cut', {}, 1)], { timeout: 4, tries: 1, deadline_ms: Date.now() + 3600 }),
+  );
+  assert.deepEqual(
+    json.outcomes.map((o: any) => [o.message_id, o.deleted, o.released, o.release_delay, o.keeps_tries, o.failed]),
+    [
+      ['a', true, false, null, undefined, false],
+      ['b', false, true, null, true, false],
+    ],
+  );
+  assert.equal(json.outcomes[1].error, "stopped at the batch's deadline");
+});
+
+for (const [used, cut] of [
+  [100, false],
+  [400, true],
+] as const) {
+  test(`a later job is cut only when earlier work took more than the slack: ${used}ms used`, async () => {
+    defineJob(`q-slack-first-${used}`, () => busy(used));
+    defineJob(`q-slack-${used}`, waitsForAbort);
+
+    // 4s left keeps back 2s: the batch has 2s, far under the job's own 55s,
+    // so that is its full time, and the slack is a tenth of it, 200ms.
+    const { json } = await deliver(
+      batch([record('a', `q-slack-first-${used}`, {}, 1), record('b', `q-slack-${used}`, {}, 1)], { timeout: 60, tries: 1, deadline_ms: Date.now() + 4000 }),
+    );
+    const o = json.outcomes[1];
+    if (cut) {
+      assert.deepEqual([o.released, o.release_delay, o.keeps_tries, o.failed], [true, null, true, false]);
+    } else {
+      assert.deepEqual([o.released, o.failed, o.dead_letter, 'keeps_tries' in o], [false, true, true, false]);
+    }
+  });
+}
 
 /** Blocks the event loop for `ms`, as CPU-bound code does. */
 function busy(ms: number): void {
@@ -221,11 +281,17 @@ test('a handler that blocks past its time limit is never deleted, even though it
   }
 });
 
-test('a handler that blocks past the batch deadline is released, never deleted', async () => {
-  defineJob('q-blocks-cut', () => busy(1200));
-  // 2s left keeps back 1s: the batch stops 1s from now.
-  const { json } = await deliver(batch([record('m1', 'q-blocks-cut', {}, 1)], { timeout: 60, tries: 1, deadline_ms: Date.now() + 2000 }));
-  assert.deepEqual([json.outcomes[0].deleted, json.outcomes[0].released, json.outcomes[0].release_delay, json.outcomes[0].failed], [false, true, null, false]);
+test('a handler that blocks past the batch deadline after earlier work is released, never deleted', async () => {
+  defineJob('q-blocks-cut-first', () => busy(400));
+  defineJob('q-blocks-cut', () => busy(800));
+  // 2s left keeps back 1s: the batch stops 1s from now, and the first job
+  // takes 0.4s of it. The second blocks past the cutoff, and returns before
+  // the watchdog's grace (half the 1s left to the platform's end) runs out.
+  const { json } = await deliver(
+    batch([record('a', 'q-blocks-cut-first', {}, 1), record('b', 'q-blocks-cut', {}, 1)], { timeout: 60, tries: 1, deadline_ms: Date.now() + 2000 }),
+  );
+  const o = json.outcomes[1];
+  assert.deepEqual([o.deleted, o.released, o.release_delay, o.keeps_tries, o.failed], [false, true, null, true, false]);
 });
 
 test('without a deadline the batch has the timeout budget from arrival, and a job cut by it is released', async () => {
@@ -242,20 +308,42 @@ test('without a deadline the batch has the timeout budget from arrival, and a jo
       ['b', false, true, null, false],
     ],
   );
+  assert.equal(json.outcomes[1].keeps_tries, true);
 });
 
 test('without a deadline the first job is bounded by the batch budget too: time spent before it counts', async () => {
-  // A 2s timeout gives the batch 1s from arrival. Reading a 1MB batch takes
-  // part of it, so a handler taking the rest and a little more ends past the
-  // cutoff: cut short by the batch, released, never deleted, and no try
-  // counted on its last try.
-  defineJob('q-budget-large', () => busy(1000));
+  // A 4s timeout gives the batch 2s from arrival. Reading a 1MB batch takes
+  // part of it, so a handler taking the whole 2s ends past the cutoff: out
+  // of time, never deleted. Reading the batch is not earlier work (it takes
+  // far less than the 200ms slack), so the job owns the timeout and fails on
+  // its last try.
+  defineJob('q-budget-large', () => busy(2000));
   const payload = { blob: 'x'.repeat(1_000_000) };
-  const { json } = await deliver(batch([record('m1', 'q-budget-large', payload, 1)], { timeout: 2, tries: 1 }));
-  assert.deepEqual(
-    [json.outcomes[0].deleted, json.outcomes[0].released, json.outcomes[0].release_delay, json.outcomes[0].failed],
-    [false, true, null, false],
-  );
+  const { json } = await deliver(batch([record('m1', 'q-budget-large', payload, 1)], { timeout: 4, tries: 1 }));
+  const o = json.outcomes[0];
+  assert.deepEqual([o.deleted, o.released, o.failed, 'keeps_tries' in o], [false, false, true, false]);
+  assert.match(o.error, /time limit/);
+});
+
+const { cutByBatch } = (await import(new URL('../../dist/esm/queue/runner.js', import.meta.url).href)) as typeof import('../dist/esm/queue/runner.js');
+
+test('the cut rule boundary', () => {
+  const table: Array<[left: number, own: number, whole: number, cut: boolean]> = [
+    // Full time is the job's own 10s; the slack is 1s.
+    [9000, 10_000, 20_000, false],
+    [8999, 10_000, 20_000, true],
+    // On the platform the batch is a little shorter than the job's own
+    // limit: full time is the batch's 54s.
+    [54_000, 55_000, 54_000, false],
+    [53_000, 55_000, 54_000, false],
+    [52_999, 55_000, 54_000, true],
+    // A short batch: a tenth of it.
+    [450, 55_000, 500, false],
+    [449, 55_000, 500, true],
+  ];
+  for (const [left, own, whole, cut] of table) {
+    assert.equal(cutByBatch(left, own, whole), cut, `${left}, ${own}, ${whole}`);
+  }
 });
 
 /** Delivers [finishes, `job`] to the fixture app in a child process, and expects the watchdog to kill it. */

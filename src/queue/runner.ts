@@ -15,16 +15,25 @@
  * - The handler resolved: deleted.
  * - The handler threw or timed out: released after `backoff` seconds while
  *   attempts are left, else failed.
- * - The batch's time ran out before the job started, or while it ran: it is
- *   released with no failure counted against it, to run in a later delivery.
+ * - The batch's time ran out before the job started, or earlier work in the
+ *   batch left it short of its full time and it ran out (see cutByBatch): it
+ *   is released at once, keeping its tries (`keeps_tries`), to run in a later
+ *   delivery. That relies on the platform delivering the message again with
+ *   its count of tries kept; where it can't, the next delivery counts as a
+ *   try after all.
+ *
+ * `attempts` is the platform's count of the tries the job has used, this one
+ * included; every release but those for the batch's time uses one.
  *
  * Time: each job has `timeout` seconds less a margin (5 seconds, or half the
  * timeout when that is less) for reporting outcomes. The batch has one
  * deadline as well: the platform's `deadline_ms`, less the same kind of
  * margin, or else the job time counted from when the batch's request
  * arrived. A job's limit is the earlier of the two, for every job of the
- * batch, the first included; a job stopped by the batch's deadline rather
- * than its own limit is released.
+ * batch, the first included. A first job runs to the batch's deadline, a
+ * little before its own limit, and running out of time there is its own
+ * timeout; a later job that earlier work left short of that time is
+ * released.
  *
  * Stopping a job: when it runs out of time its `signal` is aborted, and the
  * handler has a short grace to settle; its outcome (never an
@@ -40,7 +49,7 @@
 import { bridgeLog, currentRequestId, exceptionRecord, structuredLogs } from '../logging.js';
 import { decodeMessage, InvalidMessage } from './message.js';
 import { jobHandler } from './jobs.js';
-import { deleted, failed, released, type JobOutcome } from './outcome.js';
+import { deleted, failed, released, releasedForTime, type JobOutcome } from './outcome.js';
 import { watch } from './watchdog.js';
 
 /** The most seconds kept back from a timeout or deadline for answering. */
@@ -48,6 +57,9 @@ export const MARGIN = 5;
 
 /** How long past its limit a job holding the event loop is given before the process is killed, at most. */
 export const GRACE_MS = 1000;
+
+/** The most of a job's full time, in ms, that earlier work in its batch may take with the job still owning a timeout (see cutByBatch). */
+export const MAX_CUT_SLACK_MS = 1000;
 
 /** SQS's longest visibility timeout: a released message waits at most this. */
 export const MAX_RELEASE_DELAY = 43200;
@@ -68,6 +80,34 @@ export interface QueueOptions {
 /** The seconds a job may run on a queue with the given timeout. */
 export function jobSeconds(timeout: number): number {
   return Math.max(1, timeout - Math.min(MARGIN, Math.floor(timeout / 2)));
+}
+
+/**
+ * Whether the batch's deadline, `leftMs` away as a job starts, cuts the job
+ * short of its full time because earlier work in the batch used that time
+ * up.
+ *
+ * A job's full time is what it gets as the batch's first: its own limit
+ * `ownMs`, or the batch's `wholeMs` (from when the batch arrived to its
+ * deadline) when that is shorter. The platform's deadline comes from its own
+ * timeout, which is the queue's, less a margin it keeps for answering, and
+ * reaching the app takes a moment more; so on the platform the whole batch
+ * is a little shorter than a job's own limit, and a first job runs to the
+ * batch's deadline. Running into it is still the job's own timeout, which
+ * uses a try.
+ *
+ * A later job is cut only when the time before it took more than a tenth of
+ * its full time, a second at most: the same allowance the platform keeps
+ * back from a batch's time for answering. Less than that is the bridge's own
+ * work between records (reading the batch, decoding a message), not another
+ * job's run, and a job that had all but that much of its full time ran out
+ * of time on its own.
+ *
+ * Internal: exported for the tests, not from the package's index.
+ */
+export function cutByBatch(leftMs: number, ownMs: number, wholeMs: number): boolean {
+  const full = Math.min(ownMs, wholeMs);
+  return leftMs < full - Math.min(MAX_CUT_SLACK_MS, Math.max(full, 0) / 10);
 }
 
 /**
@@ -92,7 +132,7 @@ export async function runBatch(records: QueueRecord[], options: QueueOptions = {
 
   const outcomes: JobOutcome[] = [];
   for (const record of records) {
-    outcomes.push(await runOne(typeof record === 'object' && record !== null ? record : {}, { tries, backoff, jobMs, cutoff, end }));
+    outcomes.push(await runOne(typeof record === 'object' && record !== null ? record : {}, { tries, backoff, jobMs, cutoff, end, wholeMs: cutoff - received }));
   }
   return outcomes;
 }
@@ -104,6 +144,8 @@ interface Policy {
   cutoff: number;
   /** When the platform ends the invocation, Unix ms. */
   end: number;
+  /** The ms from the batch's arrival to its cutoff. */
+  wholeMs: number;
 }
 
 async function runOne(record: QueueRecord, policy: Policy): Promise<JobOutcome> {
@@ -132,10 +174,10 @@ async function runOne(record: QueueRecord, policy: Policy): Promise<JobOutcome> 
   const started = Date.now();
   const left = policy.cutoff - started;
   if (left <= 0) {
-    return released(messageId, attempts, null, "not started: the batch's time ran out");
+    return releasedForTime(messageId, attempts, "not started: the batch's time ran out");
   }
-  const cut = left < policy.jobMs;
-  const limit = cut ? left : policy.jobMs;
+  const cut = cutByBatch(left, policy.jobMs, policy.wholeMs);
+  const limit = Math.min(left, policy.jobMs);
   const label = `Job ${message.job} [${message.id}]`;
 
   // The hard stop: a short grace after the job's limit, half the time left
@@ -191,7 +233,7 @@ async function runOne(record: QueueRecord, policy: Policy): Promise<JobOutcome> 
     watchdog.disarm();
     if (cut) {
       bridgeLog.warning(`${label} was stopped at the batch's deadline; it runs again in a later delivery`);
-      return released(messageId, attempts, null, "stopped at the batch's deadline");
+      return releasedForTime(messageId, attempts, "stopped at the batch's deadline");
     }
     return retryOrFail(messageId, attempts, policy, `${label} ran past its ${Math.round(limit / 1000)}s time limit`);
   }
